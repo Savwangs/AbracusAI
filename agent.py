@@ -4,27 +4,11 @@ from typing import Dict, List, Optional
 from enum import Enum
 from pydantic import BaseModel, Literal
 import json
+import os
+from openai import OpenAI
 
 SIGNAL_DETECTION_WINDOW = timedelta(weeks=2)
 DATASET = "enterprise_sales_calls_1000_humanized.csv"
-
-class EventListener(BaseModel):
-    event_type: Literal[
-        "vendor_product_update", 
-        "vendor_compliance_update", 
-        "vendor_feature_update", 
-        "target_product_update", 
-        "target_milestone_update",
-        "other"
-    ]
-    description: Optional[str] = None
-
-class Action(BaseModel):
-    action: Literal["follow_up", "add_event_listener", "no_action"]
-    call_id: str
-    followup_context: Optional[str] = None
-    event_listener: Optional[EventListener] = None
-
 
 class OpportunityClassification(str, Enum):
     NO_BUDGET = "no_budget"
@@ -36,6 +20,12 @@ class OpportunityClassification(str, Enum):
     SATISFIED_WITH_CURRENT_SOLUTION = "satisfied_with_current_solution"
     NOT_A_PRIORITY_FOR_LEADERSHIP = "not_a_priority_for_leadership"
     OTHER = "other"
+
+class Action(BaseModel):
+    opportunity_type: OpportunityClassification
+    action: Literal["follow_up", "add_event_listener", "no_action"]
+    call_id: str
+    followup_context: Optional[str] = None
 
 class Agent:
 
@@ -74,16 +64,18 @@ class Agent:
         """
         return []
 
-    def surface_opportunities(self, open_calls: pd.DataFrame) -> list[OpportunityClassification]:
+    def surface_opportunities(self, open_calls: pd.DataFrame) -> list[Action]:
         """
         Surface opportunities for the open calls.
+        Returns a list of Action objects containing both 
+        the opportunity classification and recommended actions for each call.
         """
         opportunities = []
         
-        for call_id in open_calls["call_id"]:
-            call_df = open_calls[open_calls["call_id"] == call_id]
-            opportunity = self.__classify_call(call_id, call_df)
-            opportunities.append(opportunity)
+        for call_id in open_calls["id"]:
+            # Call the combined classification and action planning function
+            action = self.__handle_opportunity_type(open_calls, call_id)
+            opportunities.append(action)
         
         return opportunities
 
@@ -111,36 +103,24 @@ class Agent:
         ]
 
         return open_calls, recent_closed_calls
-    
-    def __classify_call(self, call_id: str, call_df: pd.DataFrame) -> OpportunityClassification:
-        """
-        Classify a call by specific opportunity. 
-        Args:
-            call_id (str): The call id.
-            call_df (pd.DataFrame): The call dataframe.
 
-        Returns:
-            OpportunityClassification: The opportunity classification.
+    def __handle_opportunity_type(self, df: pd.DataFrame, call_id: str) -> Action:
         """
-        return OpportunityClassification.NO_BUDGET
-
-    def __handle_opportunity_type(self, df: pd.DataFrame, call_id: str, opportunity_type: OpportunityClassification) -> Action:
-        """
-        Handle the opportunity type using LLM to generate personalized action plans.
+        Classify the opportunity and generate personalized action plans using LLM.
 
         Args:
             df (pd.DataFrame): The dataframe containing all calls.
             call_id (str): The ID of the specific call to handle.
-            opportunity_type (OpportunityClassification): The opportunity type.
 
         Returns:
-            Action: An Action object dictating the action to take.
+            Action: An Action object containing the opportunity type classification and action to take.
         """
         # Query the dataframe to get the specific call row
         call_row = df[df['id'] == call_id]
         
         if call_row.empty:
             return Action(
+                opportunity_type=OpportunityClassification.OTHER,
                 action="follow_up",
                 call_id=call_id,
                 followup_context="ERROR: Call ID not found in database. Please verify the call exists."
@@ -164,29 +144,36 @@ class Agent:
         except json.JSONDecodeError:
             formatted_transcript = str(transcript_text)
         
-        # Create comprehensive system prompt
-        system_prompt = """You are an AI sales assistant helping enterprise salespeople take the right actions based on sales call opportunities.
+        # Create comprehensive system prompt with today's date for context
+        today = datetime.now()
+        system_prompt = f"""You are an AI sales assistant helping enterprise salespeople take the right actions based on sales call opportunities.
 
-Your role is to analyze sales call transcripts and generate detailed, actionable follow-up plans for salespeople.
+TODAY'S DATE: {today.strftime('%Y-%m-%d')} ({today.strftime('%B %d, %Y')})
 
-OPPORTUNITY TYPES AND THEIR MEANINGS:
-- NO_BUDGET: Prospect has no budget allocated for the solution
-- NO_BUDGET_WITH_DATE: Prospect mentioned a specific date/timeframe when budget will be available (e.g., Q4, next fiscal year)
+Your role is to:
+1. CLASSIFY the sales call into an opportunity type based on the transcript
+2. GENERATE detailed, actionable follow-up plans for salespeople
+
+OPPORTUNITY TYPES AND THEIR MEANINGS (classify based on prospect's key objection/situation):
+- NO_BUDGET: Prospect has no budget allocated for the solution (and didn't mention when budget might be available)
+- NO_BUDGET_WITH_DATE: Prospect mentioned a specific date/timeframe when budget will be available (e.g., "Q4", "next fiscal year", "annual planning")
 - NEEDS_APPROVAL: Prospect needs approval from others but hasn't specified who
-- NEEDS_APPROVAL_WITH_NAMED_PERSON: Prospect mentioned specific stakeholders who need to approve (e.g., CFO, VP Operations)
-- NEEDS_SPECIFIC_FEATURE: Prospect requires specific features or integrations (e.g., Salesforce integration, specific capabilities)
-- NEEDS_SPECIFIC_COMPLIANCE: Prospect requires compliance certifications (e.g., GDPR, SOC2, HIPAA)
-- SATISFIED_WITH_CURRENT_SOLUTION: Prospect is happy with their current vendor/solution
-- NOT_A_PRIORITY_FOR_LEADERSHIP: This initiative is not a current priority for the company
-- OTHER: Any other situation
+- NEEDS_APPROVAL_WITH_NAMED_PERSON: Prospect mentioned specific stakeholders who need to approve (e.g., "CFO", "VP of Operations", "our director")
+- NEEDS_SPECIFIC_FEATURE: Prospect requires specific features or integrations they're not sure you have (e.g., "Salesforce integration", "API access")
+- NEEDS_SPECIFIC_COMPLIANCE: Prospect requires compliance certifications (e.g., "GDPR", "SOC2", "HIPAA", "ISO")
+- SATISFIED_WITH_CURRENT_SOLUTION: Prospect is happy with their current vendor/solution and sees no reason to switch
+- NOT_A_PRIORITY_FOR_LEADERSHIP: This initiative is not a current priority for the company (timing issue)
+- OTHER: Any other situation that doesn't clearly fit the above
 
 YOUR TASK:
-1. Analyze the call transcript to extract specific details mentioned by the prospect
-2. Based on the opportunity type and extracted details, generate a detailed 3-4 step action plan
-3. Choose the appropriate action type:
+1. FIRST: Read the entire transcript and classify it into the most appropriate opportunity type based on the prospect's main objection or situation
+2. THEN: Extract specific details mentioned by the prospect (dates, names, requirements, competitors)
+3. FINALLY: Generate a detailed 3-4 step action plan tailored to that opportunity type
+4. Choose the appropriate action type:
    - "follow_up": For situations requiring nurturing, scheduling calls, or relationship building
-   - "add_web_listener": For situations where monitoring for product/compliance updates would be valuable (typically NEEDS_SPECIFIC_FEATURE or NEEDS_SPECIFIC_COMPLIANCE)
-4. Make the action plan SPECIFIC and PERSONALIZED based on what was said in the transcript
+   - "add_event_listener": For situations where monitoring for product/compliance updates would be valuable (typically NEEDS_SPECIFIC_FEATURE or NEEDS_SPECIFIC_COMPLIANCE)
+   - "no_action": Only if the call is clearly lost with no recovery path
+5. Make the action plan SPECIFIC and PERSONALIZED based on what was said in the transcript
 
 GUIDELINES FOR ACTION PLANS:
 - Extract and reference specific details: dates (Q4, next year), stakeholder names/titles (CFO, VP), feature requirements (Salesforce), compliance needs (GDPR), competitor names
@@ -216,12 +203,13 @@ Be specific, actionable, and reference details from the transcript."""
         # Create user prompt with call details
         user_prompt = f"""CALL DATE: {call_date.strftime('%Y-%m-%d')}
 
-OPPORTUNITY TYPE: {opportunity_type.value}
-
 CALL TRANSCRIPT:
 {formatted_transcript}
 
-Based on the opportunity type and the conversation above, generate a detailed action plan for the salesperson. Extract any specific details mentioned (dates, names, features, etc.) and incorporate them into your action plan."""
+Analyze the transcript above and:
+1. Classify this call into the most appropriate opportunity type based on the prospect's main objection or situation
+2. Extract any specific details mentioned (dates, stakeholder names, features, compliance requirements, competitors)
+3. Generate a detailed action plan for the salesperson that incorporates these extracted details"""
 
         try:
             # Call OpenAI API with structured output
@@ -245,6 +233,7 @@ Based on the opportunity type and the conversation above, generate a detailed ac
         except Exception as e:
             # Fallback in case of API error
             return Action(
+                opportunity_type=OpportunityClassification.OTHER,
                 action="follow_up",
                 call_id=call_id,
                 followup_context=f"ERROR: Could not generate action plan due to API error: {str(e)}. Please review the call manually and create a follow-up plan."
