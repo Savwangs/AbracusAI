@@ -4,7 +4,8 @@ from typing import Dict, List, Optional
 from enum import Enum
 from pydantic import BaseModel, Literal
 import json
-import re
+import os
+from openai import OpenAI
 
 SIGNAL_DETECTION_WINDOW = timedelta(weeks=2)
 DATASET = "enterprise_sales_calls_1000_humanized.csv"
@@ -100,7 +101,7 @@ class Agent:
 
     def __handle_opportunity_type(self, df: pd.DataFrame, call_id: str, opportunity_type: OpportunityClassification) -> Action:
         """
-        Handle the opportunity type.
+        Handle the opportunity type using LLM to generate personalized action plans.
 
         Args:
             call_transcript (Dict[str, str]): A dictionary of the call transcript.
@@ -113,197 +114,104 @@ class Agent:
         # Extract call_id from call_transcript
         call_id = call_transcript.get("id", "")
         
-        # Parse the transcript text to extract insights
+        # Parse the transcript text
         transcript_text = call_transcript.get("transcript", "")
-        transcript_messages = []
         
+        # Format the transcript for the LLM
         try:
             if isinstance(transcript_text, str):
                 transcript_messages = json.loads(transcript_text)
+                formatted_transcript = "\n".join([
+                    f"{msg.get('speaker', 'unknown').upper()}: {msg.get('text', '')}"
+                    for msg in transcript_messages
+                ])
+            else:
+                formatted_transcript = str(transcript_text)
         except json.JSONDecodeError:
-            transcript_messages = []
+            formatted_transcript = str(transcript_text)
         
-        # Combine all prospect responses for analysis
-        prospect_text = " ".join([
-            msg.get("text", "") 
-            for msg in transcript_messages 
-            if msg.get("speaker") == "prospect"
-        ])
-        
-        # Handle each opportunity type with detailed action guidance
-        if opportunity_type == OpportunityClassification.NO_BUDGET:
-            # Extract any budget-related mentions
-            followup_context = (
-                "NO BUDGET IDENTIFIED - Multi-step engagement strategy:\n"
-                "1. Send ROI case study and cost-benefit analysis showing typical payback period (Q1 achievement)\n"
-                "2. Share customer testimonials from similar-sized companies demonstrating value\n"
-                "3. Offer flexible payment terms or pilot program to reduce upfront investment concerns\n"
-                "4. Schedule follow-up call in 30-45 days to revisit once they've reviewed materials"
+        # Create comprehensive system prompt
+        system_prompt = """You are an AI sales assistant helping enterprise salespeople take the right actions based on sales call opportunities.
+
+Your role is to analyze sales call transcripts and generate detailed, actionable follow-up plans for salespeople.
+
+OPPORTUNITY TYPES AND THEIR MEANINGS:
+- NO_BUDGET: Prospect has no budget allocated for the solution
+- NO_BUDGET_WITH_DATE: Prospect mentioned a specific date/timeframe when budget will be available (e.g., Q4, next fiscal year)
+- NEEDS_APPROVAL: Prospect needs approval from others but hasn't specified who
+- NEEDS_APPROVAL_WITH_NAMED_PERSON: Prospect mentioned specific stakeholders who need to approve (e.g., CFO, VP Operations)
+- NEEDS_SPECIFIC_FEATURE: Prospect requires specific features or integrations (e.g., Salesforce integration, specific capabilities)
+- NEEDS_SPECIFIC_COMPLIANCE: Prospect requires compliance certifications (e.g., GDPR, SOC2, HIPAA)
+- SATISFIED_WITH_CURRENT_SOLUTION: Prospect is happy with their current vendor/solution
+- NOT_A_PRIORITY_FOR_LEADERSHIP: This initiative is not a current priority for the company
+- OTHER: Any other situation
+
+YOUR TASK:
+1. Analyze the call transcript to extract specific details mentioned by the prospect
+2. Based on the opportunity type and extracted details, generate a detailed 3-4 step action plan
+3. Choose the appropriate action type:
+   - "follow_up": For situations requiring nurturing, scheduling calls, or relationship building
+   - "add_web_listener": For situations where monitoring for product/compliance updates would be valuable (typically NEEDS_SPECIFIC_FEATURE or NEEDS_SPECIFIC_COMPLIANCE)
+4. Make the action plan SPECIFIC and PERSONALIZED based on what was said in the transcript
+
+GUIDELINES FOR ACTION PLANS:
+- Extract and reference specific details: dates (Q4, next year), stakeholder names/titles (CFO, VP), feature requirements (Salesforce), compliance needs (GDPR), competitor names
+- Provide 3-4 concrete, actionable steps
+- Include timing recommendations when relevant
+- Make it detailed enough that a salesperson can immediately act on it
+- Format as a clear header followed by numbered steps
+
+EXAMPLE OUTPUT FORMATS:
+
+For NO_BUDGET_WITH_DATE (if prospect mentioned "Q4"):
+"BUDGET TIMING IDENTIFIED (Q4) - Strategic nurture plan:
+1. Send comprehensive ROI documentation and case study NOW for their Q4 planning discussions
+2. Add to calendar for follow-up in early September (2-3 weeks before Q4) to ensure inclusion in budget
+3. Share industry benchmarks showing typical 3-month payback period to strengthen internal business case
+4. Offer to join their Q4 planning meeting to present solution and answer stakeholder questions"
+
+For NEEDS_APPROVAL_WITH_NAMED_PERSON (if prospect mentioned "CFO and VP of Operations"):
+"KEY STAKEHOLDERS IDENTIFIED (CFO, VP of Operations) - Direct engagement plan:
+1. Ask your champion to introduce you directly to CFO and VP of Operations via warm email introduction
+2. Research both stakeholders on LinkedIn and prepare customized messaging (CFO: cost savings, VP Ops: efficiency)
+3. Prepare individual one-pagers for each: CFO gets ROI analysis, VP Ops gets implementation timeline
+4. Schedule brief 15-min introductory calls with each stakeholder separately before group demo"
+
+Be specific, actionable, and reference details from the transcript."""
+
+        # Create user prompt with call details
+        user_prompt = f"""CALL DATE: {call_date.strftime('%Y-%m-%d')}
+
+OPPORTUNITY TYPE: {opportunity_type.value}
+
+CALL TRANSCRIPT:
+{formatted_transcript}
+
+Based on the opportunity type and the conversation above, generate a detailed action plan for the salesperson. Extract any specific details mentioned (dates, names, features, etc.) and incorporate them into your action plan."""
+
+        try:
+            # Call OpenAI API with structured output
+            response = self.openai_client.beta.chat.completions.parse(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format=Action,
             )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NO_BUDGET_WITH_DATE:
-            # Extract specific timing mentions (Q1-Q4, fiscal year, quarters, months)
-            timing_patterns = [
-                r"Q[1-4]",
-                r"[Qq]uarter\s+\d",
-                r"next\s+(?:fiscal\s+)?year",
-                r"in\s+\d+\s+months?",
-                r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-            ]
             
-            timing_info = "at their budget cycle"
-            for pattern in timing_patterns:
-                match = re.search(pattern, prospect_text, re.IGNORECASE)
-                if match:
-                    timing_info = f"in {match.group()}"
-                    break
+            # Extract the parsed action from the response
+            action_response = response.choices[0].message.parsed
             
-            followup_context = (
-                f"BUDGET TIMING IDENTIFIED - Strategic nurture plan for follow-up {timing_info}:\n"
-                f"1. Send comprehensive ROI documentation and case study NOW for their planning discussions\n"
-                f"2. Add to calendar for follow-up 2-3 weeks before {timing_info} to ensure you're included in budget allocation\n"
-                f"3. Share industry benchmarks and competitive intel to strengthen their internal business case\n"
-                f"4. Offer to join their planning meeting to present solution and answer stakeholder questions"
+            # Update the call_id to match the current call
+            action_response.call_id = call_id
+            
+            return action_response
+            
+        except Exception as e:
+            # Fallback in case of API error
+            return Action(
+                action="follow_up",
+                call_id=call_id,
+                followup_context=f"ERROR: Could not generate action plan due to API error: {str(e)}. Please review the call manually and create a follow-up plan."
             )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NEEDS_APPROVAL:
-            followup_context = (
-                "APPROVAL PROCESS IDENTIFIED - Multi-stakeholder strategy:\n"
-                "1. Request to schedule a group call with all decision-makers to present solution efficiently\n"
-                "2. Prepare executive summary deck tailored to each stakeholder's concerns (CFO: ROI, Ops: implementation)\n"
-                "3. Send individual one-pagers addressing each stakeholder's specific priorities\n"
-                "4. Offer references from similar companies where multiple departments approved the solution"
-            )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NEEDS_APPROVAL_WITH_NAMED_PERSON:
-            # Extract stakeholder titles/names (CFO, VP, Director, etc.)
-            stakeholder_patterns = [
-                r"(?:our\s+)?(?:CFO|CEO|CTO|COO|VP|Vice President|Director|Manager)(?:\s+of\s+\w+)?",
-            ]
-            
-            stakeholders = []
-            for pattern in stakeholder_patterns:
-                matches = re.findall(pattern, prospect_text, re.IGNORECASE)
-                stakeholders.extend(matches)
-            
-            stakeholder_info = ""
-            if stakeholders:
-                unique_stakeholders = list(set(stakeholders))
-                stakeholder_info = f" - Identified: {', '.join(unique_stakeholders)}"
-            
-            followup_context = (
-                f"KEY STAKEHOLDERS IDENTIFIED{stakeholder_info} - Direct engagement plan:\n"
-                f"1. Ask your champion to introduce you directly to {stakeholders[0] if stakeholders else 'the decision-makers'} via email\n"
-                f"2. Research each stakeholder on LinkedIn and customize your messaging to their priorities\n"
-                f"3. Prepare role-specific value propositions (Finance: cost savings, Operations: efficiency gains)\n"
-                f"4. Schedule individual 15-min calls with each stakeholder before group demo to build relationships"
-            )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NEEDS_SPECIFIC_FEATURE:
-            # Extract feature/integration mentions
-            feature_patterns = [
-                r"(?:integration with |integrate with |works with )(\w+(?:\s+\w+)?)",
-                r"(\w+)\s+integration",
-                r"need\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-            ]
-            
-            features = []
-            for pattern in feature_patterns:
-                matches = re.findall(pattern, prospect_text, re.IGNORECASE)
-                features.extend(matches)
-            
-            feature_info = ""
-            if features:
-                unique_features = list(set([f for f in features if len(f) > 2]))[:3]
-                feature_info = f" - Required: {', '.join(unique_features)}"
-            
-            followup_context = (
-                f"SPECIFIC FEATURE REQUIREMENT{feature_info} - Documentation and monitoring strategy:\n"
-                f"1. Send detailed technical documentation showing feature capabilities and specs immediately\n"
-                f"2. Provide implementation guide and setup timeline for the required features\n"
-                f"3. SET WEB LISTENER: Monitor for product updates/announcements related to this feature\n"
-                f"4. Offer to schedule technical deep-dive with solutions engineer to address all questions"
-            )
-            return Action(action="add_web_listener", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NEEDS_SPECIFIC_COMPLIANCE:
-            # Extract compliance requirements (GDPR, SOC2, HIPAA, etc.)
-            compliance_patterns = [
-                r"(GDPR|SOC\s*2|HIPAA|ISO\s*\d+|PCI[\s-]?DSS|CCPA)",
-                r"(compliance|compliant)",
-            ]
-            
-            compliance_reqs = []
-            for pattern in compliance_patterns:
-                matches = re.findall(pattern, prospect_text, re.IGNORECASE)
-                compliance_reqs.extend(matches)
-            
-            compliance_info = ""
-            if compliance_reqs:
-                unique_compliance = list(set([c.upper() for c in compliance_reqs if len(c) > 3]))[:3]
-                compliance_info = f" - Required: {', '.join(unique_compliance)}"
-            
-            followup_context = (
-                f"COMPLIANCE REQUIREMENT IDENTIFIED{compliance_info} - Proof and monitoring strategy:\n"
-                f"1. Send compliance certifications, audit reports, and security documentation immediately\n"
-                f"2. Provide detailed compliance matrix showing how you meet all their regulatory requirements\n"
-                f"3. SET WEB LISTENER: Monitor for new compliance certifications or regulatory updates you obtain\n"
-                f"4. Offer call with security/compliance team to review architecture and answer technical questions"
-            )
-            return Action(action="add_web_listener", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.SATISFIED_WITH_CURRENT_SOLUTION:
-            # Extract competitor mentions
-            competitor_patterns = [
-                r"(?:using|use|have|with)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
-                r"([A-Z][a-z]+)\s+(?:right now|currently)",
-            ]
-            
-            competitors = []
-            for pattern in competitor_patterns:
-                matches = re.findall(pattern, prospect_text)
-                competitors.extend(matches)
-            
-            competitor_info = ""
-            if competitors:
-                # Filter for likely company names (capitalize, not common words)
-                likely_competitors = [c for c in competitors if len(c) > 3 and c not in ['Sure', 'Yeah', 'Okay']][:2]
-                if likely_competitors:
-                    competitor_info = f" - Current vendor: {', '.join(likely_competitors)}"
-            
-            followup_context = (
-                f"SATISFIED WITH INCUMBENT{competitor_info} - Competitive displacement strategy:\n"
-                f"1. Send competitive comparison sheet highlighting your unique advantages and differentiators\n"
-                f"2. Share case studies of companies who switched from their current provider to you\n"
-                f"3. Focus on what they're likely missing: newer features, better pricing, superior support\n"
-                f"4. Set 6-month follow-up reminder (contracts often renew annually - position for next cycle)"
-            )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        elif opportunity_type == OpportunityClassification.NOT_A_PRIORITY_FOR_LEADERSHIP:
-            # Extract timing or priority mentions
-            timing_match = re.search(r"(next\s+(?:quarter|month|year)|Q[1-4]|\d+\s+months?)", prospect_text, re.IGNORECASE)
-            timing_info = timing_match.group(1) if timing_match else "3-6 months"
-            
-            followup_context = (
-                f"NOT CURRENT PRIORITY - Long-term nurture strategy for re-engagement in {timing_info}:\n"
-                f"1. Send value-add content (industry reports, best practices) to stay top-of-mind without being pushy\n"
-                f"2. Connect on LinkedIn and engage with their posts to maintain relationship warmth\n"
-                f"3. Set calendar reminder to follow up in {timing_info} when priorities may have shifted\n"
-                f"4. Monitor their company news (funding, expansion, leadership changes) that could reprioritize this need"
-            )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
-        
-        else:  # OTHER or any unhandled type
-            followup_context = (
-                "GENERAL FOLLOW-UP - Standard engagement strategy:\n"
-                "1. Send meeting recap email summarizing discussion points and next steps within 24 hours\n"
-                "2. Provide relevant resources (case studies, product information) based on conversation topics\n"
-                "3. Propose specific next action with date/time options (demo, technical call, or stakeholder meeting)\n"
-                "4. Set follow-up reminder for 7-10 days if no response to initial outreach"
-            )
-            return Action(action="follow_up", call_id=call_id, followup_context=followup_context)
