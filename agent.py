@@ -4,16 +4,27 @@ from typing import Dict, List, Optional
 from enum import Enum
 from pydantic import BaseModel, Literal
 import json
-import os
-from openai import OpenAI
 
 SIGNAL_DETECTION_WINDOW = timedelta(weeks=2)
 DATASET = "enterprise_sales_calls_1000_humanized.csv"
 
+class EventListener(BaseModel):
+    event_type: Literal[
+        "vendor_product_update", 
+        "vendor_compliance_update", 
+        "vendor_feature_update", 
+        "target_product_update", 
+        "target_milestone_update",
+        "other"
+    ]
+    description: Optional[str] = None
+
 class Action(BaseModel):
-    action: Literal["follow_up", "add_web_listener", "no_action"]
+    action: Literal["follow_up", "add_event_listener", "no_action"]
     call_id: str
     followup_context: Optional[str] = None
+    event_listener: Optional[EventListener] = None
+
 
 class OpportunityClassification(str, Enum):
     NO_BUDGET = "no_budget"
@@ -48,22 +59,33 @@ class Agent:
         opportunities = self.surface_opportunities(open_calls)
 
         # 5. Get all closed calls from the previous 2 weeks, run signal detection on them.
-        signals = self.detect_signals(recent_closed_calls)
+        signals = self.detect_signals(today, recent_closed_calls)
 
         # 6. Return a) current opportunities and action items to take, and b) a list of proposed new signals to add to the dataset.
         return opportunities, signals
 
-    def detect_signals(self, start_date: datetime, end_date: datetime) -> list[str]:
+    def detect_signals(self, today: datetime, recent_closed_calls: pd.DataFrame) -> list[str]:
         """
         Detect signals from the script.
+        
+        1. Extract user purchase reasoning
+        2. Extract ICP details
+        
         """
         return []
 
-    def surface_opportunities(self, day: datetime) -> list[str]:
+    def surface_opportunities(self, open_calls: pd.DataFrame) -> list[OpportunityClassification]:
         """
-        Surface opportunities for the day.
+        Surface opportunities for the open calls.
         """
-        return []
+        opportunities = []
+        
+        for call_id in open_calls["call_id"]:
+            call_df = open_calls[open_calls["call_id"] == call_id]
+            opportunity = self.__classify_call(call_id, call_df)
+            opportunities.append(opportunity)
+        
+        return opportunities
 
     # helpers
     def __segment_calls(self, df: pd.DataFrame, today: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
