@@ -6,6 +6,9 @@ from pydantic import BaseModel, Literal
 import json
 import re
 
+SIGNAL_DETECTION_WINDOW = timedelta(weeks=2)
+DATASET = "enterprise_sales_calls_1000_humanized.csv"
+
 class Action(BaseModel):
     action: Literal["follow_up", "add_web_listener", "no_action"]
     call_id: str
@@ -24,8 +27,27 @@ class OpportunityClassification(str, Enum):
 
 class Agent:
 
-    def __init__(self, dataset: pd.DataFrame):
-        self.dataset = dataset
+    def main(self):
+        """
+        Main function.
+        """
+        # 1. load data
+        df = pd.read_csv(DATASET)
+
+        # 2. get today's date
+        today = datetime.now()
+
+        # 3. get a set of open/active calls, and closed calls from the previous 2 weeks.
+        open_calls, recent_closed_calls = self.__segment_calls(df, today)
+
+        # 4. Identify opportunities / actions to take for all open calls.
+        opportunities = self.surface_opportunities(open_calls)
+
+        # 5. Get all closed calls from the previous 2 weeks, run signal detection on them.
+        signals = self.detect_signals(recent_closed_calls)
+
+        # 6. Return a) current opportunities and action items to take, and b) a list of proposed new signals to add to the dataset.
+        return opportunities, signals
 
     def detect_signals(self, start_date: datetime, end_date: datetime) -> list[str]:
         """
@@ -39,19 +61,44 @@ class Agent:
         """
         return []
 
-    # Search helpers
-    def __cluster_calls(self, end_date: datetime) -> Dict[OpportunityClassification, List[str]]:
+    # helpers
+    def __segment_calls(self, df: pd.DataFrame, today: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Cluster phone calls by specific opportunity. 
+        Segment calls into open/active and closed.
+        """
+        # Define what statuses are open/active and closed
+        OPEN_STATUSES = {"initial_contact", "discovery", "follow_up", "negotiation", "objection_handling", "demo_scheduled"}
+        CLOSED_STATUSES = {"closed_won", "closed_lost"}
+
+        # Ensure date column is parsed as datetime
+        df["date"] = pd.to_datetime(df["date"])
+        
+        # Filter open/active calls as of today
+        open_calls = df[df["status"].isin(OPEN_STATUSES)]
+
+        # Filter closed calls from the previous 2 weeks
+        two_weeks_ago = today - SIGNAL_DETECTION_WINDOW
+        recent_closed_calls = df[
+            (df["status"].isin(CLOSED_STATUSES)) &
+            (df["date"] >= two_weeks_ago) &
+            (df["date"] <= today)
+        ]
+
+        return open_calls, recent_closed_calls
+    
+    def __classify_call(self, call_id: str, call_df: pd.DataFrame) -> OpportunityClassification:
+        """
+        Classify a call by specific opportunity. 
         Args:
-            end_date (datetime): The end date to cluster calls by.
+            call_id (str): The call id.
+            call_df (pd.DataFrame): The call dataframe.
 
         Returns:
-            Dict[OpportunityClassification, List[str]]: A dictionary of opportunity classifications and the calls that belong to them.
+            OpportunityClassification: The opportunity classification.
         """
-        return {}
+        return OpportunityClassification.NO_BUDGET
 
-    def __handle_opportunity_type(self, call_transcript: Dict[str, str], call_date: datetime, opportunity_type: OpportunityClassification) -> Action:
+    def __handle_opportunity_type(self, df: pd.DataFrame, call_id: str, opportunity_type: OpportunityClassification) -> Action:
         """
         Handle the opportunity type.
 
