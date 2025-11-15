@@ -75,17 +75,17 @@ class Agent:
         CLOSED_STATUSES = {"closed_won", "closed_lost"}
 
         # Ensure date column is parsed as datetime
-        df["date"] = pd.to_datetime(df["date"])
+        df["call_date"] = pd.to_datetime(df["call_date"])
         
         # Filter open/active calls as of today
-        open_calls = df[df["status"].isin(OPEN_STATUSES)]
+        open_calls = df[df["call_stage"].isin(OPEN_STATUSES)]
 
         # Filter closed calls from the previous 2 weeks
         two_weeks_ago = today - SIGNAL_DETECTION_WINDOW
         recent_closed_calls = df[
-            (df["status"].isin(CLOSED_STATUSES)) &
-            (df["date"] >= two_weeks_ago) &
-            (df["date"] <= today)
+            (df["call_stage"].isin(CLOSED_STATUSES)) &
+            (df["call_date"] >= two_weeks_ago) &
+            (df["call_date"] <= today)
         ]
 
         return open_calls, recent_closed_calls
