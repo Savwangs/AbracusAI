@@ -23,7 +23,7 @@ class OpportunityClassification(str, Enum):
 
 class Action(BaseModel):
     opportunity_type: OpportunityClassification
-    action: Literal["follow_up", "add_event_listener", "no_action"]
+    action: Literal["follow_up", "no_action"]
     call_id: str
     followup_context: Optional[str] = None
 
@@ -171,7 +171,6 @@ YOUR TASK:
 3. FINALLY: Generate a detailed 3-4 step action plan tailored to that opportunity type
 4. Choose the appropriate action type:
    - "follow_up": For situations requiring nurturing, scheduling calls, or relationship building
-   - "add_event_listener": For situations where monitoring for product/compliance updates would be valuable (typically NEEDS_SPECIFIC_FEATURE or NEEDS_SPECIFIC_COMPLIANCE)
    - "no_action": Only if the call is clearly lost with no recovery path
 5. Make the action plan SPECIFIC and PERSONALIZED based on what was said in the transcript
 
