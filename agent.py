@@ -28,6 +28,9 @@ class OpportunityClassification(str, Enum):
 
 class Agent:
 
+    def __init__(self):
+        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
     def main(self):
         """
         Main function.
@@ -104,18 +107,27 @@ class Agent:
         Handle the opportunity type using LLM to generate personalized action plans.
 
         Args:
-            call_transcript (Dict[str, str]): A dictionary of the call transcript.
-            call_date (datetime): The call date.
+            df (pd.DataFrame): The dataframe containing all calls.
+            call_id (str): The ID of the specific call to handle.
             opportunity_type (OpportunityClassification): The opportunity type.
 
         Returns:
             Action: An Action object dictating the action to take.
         """
-        # Extract call_id from call_transcript
-        call_id = call_transcript.get("id", "")
+        # Query the dataframe to get the specific call row
+        call_row = df[df['id'] == call_id]
         
-        # Parse the transcript text
-        transcript_text = call_transcript.get("transcript", "")
+        if call_row.empty:
+            return Action(
+                action="follow_up",
+                call_id=call_id,
+                followup_context="ERROR: Call ID not found in database. Please verify the call exists."
+            )
+        
+        # Extract call data from the row
+        call_row = call_row.iloc[0]
+        transcript_text = call_row.get('transcript', '')
+        call_date = pd.to_datetime(call_row.get('call_date', datetime.now()))
         
         # Format the transcript for the LLM
         try:
